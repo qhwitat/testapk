@@ -44,7 +44,7 @@ class ProotInstaller @Inject constructor(
         // Ubuntu 22.04 ARM64 rootfs from proot-distro v4.34.2
         // v4.x is the last version that provides direct GitHub release tarballs
         private const val ROOTFS_URL =
-            "https://github.com/termux/proot-distro/releases/download/v4.30.1/ubuntu-questing-aarch64-pd-v4.30.1.tar.xz"
+            "https://cdimage.ubuntu.com/ubuntu-base/releases/22.04/release/ubuntu-base-22.04.4-base-arm64.tar.gz"
 
         // .NET 9 Runtime ARM64 Linux — Microsoft official short URL (follows to latest 9.x patch)
         // Phase 0 confirmed: 9.0.17 works — manual install to ~/.dotnet required
@@ -198,8 +198,7 @@ class ProotInstaller @Inject constructor(
 
             // Extract directly into rootfs at /root/.dotnet
             // Note: we extract to the host path which maps to /root/.dotnet inside proot
-            runOrThrow("tar", "-xzf", tarball.absolutePath, "-C", dotnetDir.absolutePath)
-
+            runOrThrow("tar", "-xzf", tmpFile.absolutePath, "-C", rootfsDir.absolutePath)
             // Sanity check
             val dotnetBin = File(dotnetDir, "dotnet")
             if (!dotnetBin.exists()) {
