@@ -36,7 +36,7 @@ import javax.inject.Singleton
 class ProotInstaller @Inject constructor(
     @ApplicationContext private val context: Context
 ) {
-    // ── Constants ─────────────────────────────────────────────────────────────
+    // ── Constants ─────────────────────────────────────────────────────────�[...]
 
     companion object {
         private const val TAG = "ProotInstaller"
@@ -65,7 +65,7 @@ class ProotInstaller @Inject constructor(
         const val REQUIRED_STORAGE_MB = 1800
     }
 
-    // ── Paths ─────────────────────────────────────────────────────────────────
+    // ── Paths ──────────────────────────────────────────────────────────��[...]
 
     /** Root of the Ubuntu Linux filesystem inside app storage */
     val rootfsDir: File get() = File(context.filesDir, "ubuntu")
@@ -81,7 +81,7 @@ class ProotInstaller @Inject constructor(
     private val worldsDir   get() = File(tshockDir, "worlds").also { it.mkdirs() }
     private fun flag(name: String) = File(context.filesDir, name)
 
-    // ── Public API ────────────────────────────────────────────────────────────
+    // ── Public API ─────────────────────────────────────────────────────────[...]
 
     /** True only when all 5 installation steps are complete */
     fun isFullyInstalled(): Boolean =
@@ -139,7 +139,7 @@ class ProotInstaller @Inject constructor(
         }
         rootfsDir.mkdirs()
 
-        val tarball = File(context.cacheDir, "ubuntu-rootfs.tar.xz")
+        val tarball = File(context.cacheDir, "ubuntu-rootfs.tar.gz")
         try {
             onProgress("Downloading Ubuntu rootfs… (~30 MB)")
             download(ROOTFS_URL, tarball) { pct ->
@@ -147,8 +147,8 @@ class ProotInstaller @Inject constructor(
             }
 
             onProgress("Extracting Ubuntu rootfs… (may take a minute)")
-            // System tar is available on Android and handles .tar.xz
-            runOrThrow("tar", "-xJf", tarball.absolutePath, "-C", rootfsDir.absolutePath)
+            // System tar is available on Android and handles .tar.gz
+            runOrThrow("tar", "-xzf", tarball.absolutePath, "-C", rootfsDir.absolutePath)
 
             flag(FLAG_ROOTFS).createNewFile()
             Log.i(TAG, "Ubuntu rootfs ready → ${rootfsDir.absolutePath}")
@@ -196,9 +196,8 @@ class ProotInstaller @Inject constructor(
             onProgress("Installing .NET 9 Runtime…")
             dotnetDir.mkdirs()
 
-            // Extract directly into rootfs at /root/.dotnet
-            // Note: we extract to the host path which maps to /root/.dotnet inside proot
-            runOrThrow("tar", "-xzf", tmpFile.absolutePath, "-C", rootfsDir.absolutePath)
+            // Extract .NET into the dotnetDir inside the rootfs (maps to /root/.dotnet)
+            runOrThrow("tar", "-xzf", tarball.absolutePath, "-C", dotnetDir.absolutePath)
             // Sanity check
             val dotnetBin = File(dotnetDir, "dotnet")
             if (!dotnetBin.exists()) {
@@ -321,7 +320,7 @@ class ProotInstaller @Inject constructor(
         Log.i(TAG, "start.sh written with world-save fix → ${startScript.absolutePath}")
     }
 
-    // ── Helpers ───────────────────────────────────────────────────────────────
+    // ── Helpers ─────────────────────────────────────────────────────────��[...]
 
     /**
      * Fetches GitHub API for TShock latest release and returns the linux-arm64 .zip URL.
@@ -336,7 +335,7 @@ class ProotInstaller @Inject constructor(
 
         // Match: "browser_download_url": "...linux-arm64....zip"
         val pattern = Regex(
-            """"browser_download_url"\s*:\s*"([^"]+linux-arm64[^"]*\.zip)""""
+            """"browser_download_url"\s*:\s*"([^\"]+linux-arm64[^\"]*\.zip)"""
         )
         return pattern.find(json)?.groupValues?.get(1)
             ?: throw RuntimeException(
