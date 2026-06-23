@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+        Theme.Black.NoTitleBar — موجود في الـ public Android SDK من API 1
+        لا يحتاج أي dependency. Compose يرسم فوقه كل شيء.
+
+        DeviceDefault و Material.Light ← ليسوا public API، AAPT2 يرفضهم.
+    -->
+    <style name="Theme.NotyetTerrariaHost" parent="android:Theme.Black.NoTitleBar">
+        <item name="android:windowBackground">@android:color/black</item>
+    </style>
+</resources>

@@ -1,0 +1,82 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+# ── SDK path ثابت على كل ubuntu-latest runner ────────────────────────────────
+env:
+  ANDROID_HOME: /usr/local/lib/android/sdk
+  ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+
+jobs:
+  build:
+    name: Build Debug APK
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      # Gradle 8.9 — المشروع ما فيه wrapper، نولّده هنا
+      - name: Install Gradle 8.9
+        run: |
+          wget -q https://services.gradle.org/distributions/gradle-8.9-bin.zip \
+               -O /tmp/gradle.zip
+          unzip -q /tmp/gradle.zip -d /opt/gradle
+          echo "/opt/gradle/gradle-8.9/bin" >> $GITHUB_PATH
+
+      - name: Generate Gradle Wrapper
+        run: |
+          gradle wrapper --gradle-version 8.9
+          chmod +x gradlew
+
+      # كاش يسرّع الـ builds القادمة
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ hashFiles('**/*.gradle.kts') }}
+          restore-keys: gradle-
+
+      # android-35 موجود مسبقاً على runner — نقبل الـ licenses فقط
+      - name: Accept Android SDK licenses
+        run: |
+          yes | $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager \
+            --licenses 2>/dev/null || true
+
+      # تأكيد وجود android-35 — لو مش موجود يثبّته
+      - name: Ensure android-35 platform
+        run: |
+          if [ ! -f "$ANDROID_SDK_ROOT/platforms/android-35/android.jar" ]; then
+            echo "android-35 not found, installing..."
+            $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager \
+              "platforms;android-35" "build-tools;35.0.0"
+          else
+            echo "✅ android-35 already present"
+            ls -lh "$ANDROID_SDK_ROOT/platforms/android-35/android.jar"
+          fi
+
+      # البناء — downloadProotBinary يتخطى (proot موجود 229KB > 100KB)
+      - name: Build Debug APK
+        run: ./gradlew assembleDebug --no-daemon --stacktrace
+        env:
+          ANDROID_HOME: /usr/local/lib/android/sdk
+
+      - name: Upload Debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: notyet-terraria-host-v0.1-debug
+          path: app/build/outputs/apk/debug/*.apk
+          retention-days: 30
+          if-no-files-found: error
