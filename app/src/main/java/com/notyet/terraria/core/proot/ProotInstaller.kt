@@ -44,8 +44,7 @@ class ProotInstaller @Inject constructor(
         // Ubuntu 22.04 ARM64 rootfs from proot-distro v4.34.2
         // v4.x is the last version that provides direct GitHub release tarballs
         private const val ROOTFS_URL =
-            "https://github.com/termux/proot-distro/releases/download/v4.34.2/" +
-            "ubuntu-aarch64-pd-v4.34.2.tar.xz"
+            "https://github.com/termux/proot-distro/releases/download/v4.30.1/ubuntu-questing-aarch64-pd-v4.30.1.tar.xz"
 
         // .NET 9 Runtime ARM64 Linux — Microsoft official short URL (follows to latest 9.x patch)
         // Phase 0 confirmed: 9.0.17 works — manual install to ~/.dotnet required
