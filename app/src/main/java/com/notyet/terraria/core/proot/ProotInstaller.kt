@@ -84,6 +84,10 @@ class ProotInstaller @Inject constructor(
      *  Lives in nativeLibraryDir which is always executable (unlike filesDir on Android 10+). */
     val prootBinary: File get() = File(context.applicationInfo.nativeLibraryDir, "libproot.so")
 
+    /** proot needs libtalloc.so.2 — extracted from assets to filesDir at first run.
+     *  filesDir allows shared library loading (mmap) even though it's noexec. */
+    val tallocLib: File get() = File(context.filesDir, "libtalloc.so.2")
+
     /** Temp directory for proot internal use */
     val tmpDir: File get() = File(context.cacheDir, "proot_tmp").also { it.mkdirs() }
 
@@ -109,10 +113,7 @@ class ProotInstaller @Inject constructor(
      * @param onProgress called with human-readable status strings for UI display
      */
     suspend fun setup(onProgress: (String) -> Unit) = withContext(Dispatchers.IO) {
-        // step1 removed — proot is in nativeLibraryDir, extracted automatically at APK install
-        if (!prootBinary.exists()) throw RuntimeException(
-            "proot not found at ${prootBinary.absolutePath} — reinstall the APK"
-        )
+        step1_PrepareTalloc(onProgress)
         step2_DownloadRootfs(onProgress)
         step3_InstallDeps(onProgress)
         step4_InstallDotnet(onProgress)
@@ -120,6 +121,31 @@ class ProotInstaller @Inject constructor(
         step6_WriteStartScript()
         onProgress("✅ Setup complete — ready to start server")
         Log.i(TAG, "Full setup complete")
+    }
+
+    // ── Step 1: Extract libtalloc.so.2 from assets to filesDir ──────────────
+    // proot (from Termux) is dynamically linked against libtalloc.so.2.
+    // Android nativeLibraryDir only accepts lib*.so naming — libtalloc.so.2 can't go there.
+    // Solution: bundle in assets, extract to filesDir, use LD_LIBRARY_PATH at exec time.
+    // filesDir is noexec (can't run binaries) but CAN be used for mmap/dlopen (.so loading).
+
+    private fun step1_PrepareTalloc(onProgress: (String) -> Unit) {
+        if (tallocLib.exists() && tallocLib.length() > 10_000L) {
+            Log.d(TAG, "libtalloc.so.2 already in filesDir, skipping")
+            return
+        }
+        onProgress("Preparing proot dependencies…")
+        try {
+            context.assets.open("libtalloc.so.2").use { src ->
+                FileOutputStream(tallocLib).use { dst -> src.copyTo(dst) }
+            }
+            Log.i(TAG, "libtalloc.so.2 extracted → ${tallocLib.absolutePath}")
+        } catch (e: IOException) {
+            throw RuntimeException(
+                "libtalloc.so.2 not found in APK assets. " +
+                "Ensure the downloadProotBinary Gradle task ran successfully.", e
+            )
+        }
     }
 
     // ── Step 2: Download Ubuntu ARM64 rootfs ──────────────────────────────────
@@ -387,7 +413,11 @@ class ProotInstaller @Inject constructor(
 
         val process = ProcessBuilder(cmd)
             .redirectErrorStream(true)
-            .apply { environment()["PROOT_TMP_DIR"] = tmpDir.absolutePath }
+            .apply {
+                environment()["PROOT_TMP_DIR"]    = tmpDir.absolutePath
+                // libtalloc.so.2 is in filesDir — tell the dynamic linker where to find it
+                environment()["LD_LIBRARY_PATH"]  = context.filesDir.absolutePath
+            }
             .start()
 
         val output = process.inputStream.bufferedReader().readText()

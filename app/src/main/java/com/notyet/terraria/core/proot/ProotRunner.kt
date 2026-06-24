@@ -42,8 +42,9 @@ class ProotRunner @Inject constructor(
             val process = ProcessBuilder(cmd)
                 .redirectErrorStream(true)
                 .apply {
-                    // proot needs a writable temp directory on the host FS
-                    environment()["PROOT_TMP_DIR"] = installer.tmpDir.absolutePath
+                    environment()["PROOT_TMP_DIR"]   = installer.tmpDir.absolutePath
+                    // libtalloc.so.2 lives in filesDir — dynamic linker finds it via LD_LIBRARY_PATH
+                    environment()["LD_LIBRARY_PATH"] = installer.tallocLib.parent
                 }
                 .start()
                 .also { serverProcess = it }
