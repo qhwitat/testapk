@@ -15,9 +15,9 @@ import javax.inject.Singleton
  * Manages the one-time installation of the Linux environment needed to run TShock.
  *
  * Layers installed (in order):
- *  1. proot binary   → extracted from APK assets (bundled at build time, ~500 KB)
- *  2. Ubuntu rootfs  → downloaded from proot-distro GitHub releases (~30 MB)
- *  3. System deps    → libicu-dev + unzip + wget via apt inside proot (ICU is required by .NET)
+ *  1. proot binary   → extracted from APK assets (bundled at build time, ~229 KB)
+ *  2. Ubuntu rootfs  → downloaded from Ubuntu official base images, 22.04 LTS ARM64 (~30 MB)
+ *  3. System deps    → libicu-dev + wget via apt inside proot (ICU is required by .NET)
  *  4. .NET 9 Runtime → downloaded manually to /root/.dotnet (apt doesn't have it reliably)
  *  5. TShock 6.x     → latest linux-arm64 release fetched from GitHub API
  *  6. start.sh       → generated with exact env vars proven to work on ARM64
@@ -31,20 +31,28 @@ import javax.inject.Singleton
  *   - DOTNET_GCHeapHardLimit=0x40000000 prevents OOM crash on mobile
  *   - DOTNET_gcServer=0 required for stable single-process GC on Android
  *   - TShock zip contains a nested .tar → double extraction needed
+ *   - Android toybox tar does NOT support -J (xz) → use gzip (.tar.gz) + -xzf
+ *   - Android tar cannot chown → always pass --no-same-owner
+ *   - ubuntu-base has no /etc/resolv.conf → write 8.8.8.8 after extraction
  */
 @Singleton
 class ProotInstaller @Inject constructor(
     @ApplicationContext private val context: Context
 ) {
-    // ── Constants ─────────────────────────────────────────────────────────�[...]
+    // ── Constants ─────────────────────────────────────────────────────────────
 
     companion object {
         private const val TAG = "ProotInstaller"
 
-        // Ubuntu 22.04 ARM64 rootfs from proot-distro v4.34.2
-        // v4.x is the last version that provides direct GitHub release tarballs
+        // Ubuntu 22.04 LTS ARM64 base — official Canonical CDN, gzip format
+        // LESSONS:
+        //   - proot-distro tarballs (.tar.xz) → Android toybox tar -J flag = UNSUPPORTED
+        //   - ubuntu-base .tar.gz → gzip supported on all Android (API 26+)
+        //   - ubuntu-base has no wrapper dir → do NOT use --strip-components
+        //   - ubuntu-base has no resolv.conf → write it manually after extraction
         private const val ROOTFS_URL =
-            "https://cdimage.ubuntu.com/ubuntu-base/releases/22.04/release/ubuntu-base-22.04.4-base-arm64.tar.gz"
+            "https://cdimage.ubuntu.com/ubuntu-base/releases/22.04/release/" +
+            "ubuntu-base-22.04.4-base-arm64.tar.gz"
 
         // .NET 9 Runtime ARM64 Linux — Microsoft official short URL (follows to latest 9.x patch)
         // Phase 0 confirmed: 9.0.17 works — manual install to ~/.dotnet required
@@ -65,7 +73,7 @@ class ProotInstaller @Inject constructor(
         const val REQUIRED_STORAGE_MB = 1800
     }
 
-    // ── Paths ──────────────────────────────────────────────────────────��[...]
+    // ── Paths ─────────────────────────────────────────────────────────────────
 
     /** Root of the Ubuntu Linux filesystem inside app storage */
     val rootfsDir: File get() = File(context.filesDir, "ubuntu")
@@ -81,7 +89,7 @@ class ProotInstaller @Inject constructor(
     private val worldsDir   get() = File(tshockDir, "worlds").also { it.mkdirs() }
     private fun flag(name: String) = File(context.filesDir, name)
 
-    // ── Public API ─────────────────────────────────────────────────────────[...]
+    // ── Public API ────────────────────────────────────────────────────────────
 
     /** True only when all 5 installation steps are complete */
     fun isFullyInstalled(): Boolean =
@@ -139,16 +147,30 @@ class ProotInstaller @Inject constructor(
         }
         rootfsDir.mkdirs()
 
+        // Use .tar.gz — Android toybox tar does NOT support -J (xz compression)
         val tarball = File(context.cacheDir, "ubuntu-rootfs.tar.gz")
         try {
-            onProgress("Downloading Ubuntu rootfs… (~30 MB)")
+            onProgress("Downloading Ubuntu 22.04 rootfs… (~30 MB)")
             download(ROOTFS_URL, tarball) { pct ->
                 onProgress("Downloading Ubuntu rootfs… $pct%")
             }
 
             onProgress("Extracting Ubuntu rootfs… (may take a minute)")
-            // System tar is available on Android and handles .tar.gz
-            runOrThrow("tar", "-xzf", tarball.absolutePath, "-C", rootfsDir.absolutePath)
+            // --no-same-owner: Android process cannot chown files → tar exits 1 without this
+            // No --strip-components: ubuntu-base has files at root level (no wrapper dir)
+            runOrThrow(
+                "tar", "-xzf", tarball.absolutePath,
+                "-C", rootfsDir.absolutePath,
+                "--no-same-owner"
+            )
+
+            // ubuntu-base has no /etc/resolv.conf → apt-get update fails with DNS errors
+            // Write Google DNS immediately after extraction
+            File(rootfsDir, "etc/resolv.conf").apply {
+                parentFile?.mkdirs()
+                writeText("nameserver 8.8.8.8\nnameserver 8.8.4.4\n")
+            }
+            Log.i(TAG, "resolv.conf written with Google DNS")
 
             flag(FLAG_ROOTFS).createNewFile()
             Log.i(TAG, "Ubuntu rootfs ready → ${rootfsDir.absolutePath}")
@@ -164,13 +186,21 @@ class ProotInstaller @Inject constructor(
             Log.d(TAG, "System deps already installed, skipping")
             return
         }
-        onProgress("Installing system dependencies (libicu-dev, unzip, wget)…")
-        // libicu-dev = REQUIRED for .NET 9 / TShock — app crashes without it
-        // Phase 0 lesson: "Couldn't find a valid ICU package" → apt install libicu-dev
+        onProgress("Installing system dependencies (libicu-dev, wget)…")
+
+        // Two-pass install:
+        //   Pass 1: install ca-certificates with --allow-unauthenticated (no valid certs yet)
+        //           then run update-ca-certificates
+        //   Pass 2: apt-get update with valid certs, then install libicu-dev
+        // libicu-dev = REQUIRED for .NET 9 / TShock — crashes without it
         val output = runInProot(
+            "apt-get update -qq --allow-unauthenticated 2>&1 | tail -2 && " +
+            "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends " +
+            "  --allow-unauthenticated ca-certificates 2>&1 | tail -3 && " +
+            "update-ca-certificates 2>&1 | tail -2 && " +
             "apt-get update -qq 2>&1 | tail -2 && " +
             "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends " +
-            "libicu-dev unzip wget ca-certificates 2>&1 | tail -5"
+            "  libicu-dev wget 2>&1 | tail -5"
         )
         Log.i(TAG, "apt output: $output")
         flag(FLAG_DEPS).createNewFile()
@@ -196,8 +226,14 @@ class ProotInstaller @Inject constructor(
             onProgress("Installing .NET 9 Runtime…")
             dotnetDir.mkdirs()
 
-            // Extract .NET into the dotnetDir inside the rootfs (maps to /root/.dotnet)
-            runOrThrow("tar", "-xzf", tarball.absolutePath, "-C", dotnetDir.absolutePath)
+            // Extract directly into rootfs at /root/.dotnet
+            // Note: we extract to the host path which maps to /root/.dotnet inside proot
+            runOrThrow(
+                "tar", "-xzf", tarball.absolutePath,
+                "-C", dotnetDir.absolutePath,
+                "--no-same-owner"
+            )
+
             // Sanity check
             val dotnetBin = File(dotnetDir, "dotnet")
             if (!dotnetBin.exists()) {
@@ -248,7 +284,11 @@ class ProotInstaller @Inject constructor(
                 )
 
             tshockDir.mkdirs()
-            runOrThrow("tar", "-xf", innerTar.absolutePath, "-C", tshockDir.absolutePath)
+            runOrThrow(
+                "tar", "-xf", innerTar.absolutePath,
+                "-C", tshockDir.absolutePath,
+                "--no-same-owner"
+            )
             extractTemp.deleteRecursively()
 
             // Mark TShock.Server as executable
@@ -272,14 +312,11 @@ class ProotInstaller @Inject constructor(
     /**
      * Generates /root/tshock/start.sh with the exact environment variables
      * proven in Phase 0 to work on ARM64 Android.
-     *
-     * IMPORTANT: update this method with the start.sh that fixed the world-save crash.
      */
     private fun step6_WriteStartScript() {
         // CRITICAL: TShock on ARM64 crashes (NullReferenceException in OTAPI WorldFile)
         // when world path is resolved dynamically via -worldname.
         // FIX: always provide the FULL explicit world path via -world flag.
-        // This was confirmed in Phase 0 testing.
         val worldsPath = "/root/.local/share/Terraria/Worlds"
         val worldFile  = "$worldsPath/MyWorld.wld"
 
@@ -317,10 +354,10 @@ class ProotInstaller @Inject constructor(
         })
 
         startScript.setExecutable(true, false)
-        Log.i(TAG, "start.sh written with world-save fix → ${startScript.absolutePath}")
+        Log.i(TAG, "start.sh written → ${startScript.absolutePath}")
     }
 
-    // ── Helpers ─────────────────────────────────────────────────────────��[...]
+    // ── Helpers ───────────────────────────────────────────────────────────────
 
     /**
      * Fetches GitHub API for TShock latest release and returns the linux-arm64 .zip URL.
@@ -335,7 +372,7 @@ class ProotInstaller @Inject constructor(
 
         // Match: "browser_download_url": "...linux-arm64....zip"
         val pattern = Regex(
-            """"browser_download_url"\s*:\s*"([^\"]+linux-arm64[^\"]*\.zip)"""
+            """"browser_download_url"\s*:\s*"([^"]+linux-arm64[^"]*\.zip)""""
         )
         return pattern.find(json)?.groupValues?.get(1)
             ?: throw RuntimeException(
@@ -428,7 +465,6 @@ class ProotInstaller @Inject constructor(
         Log.i(TAG, "Downloaded ${dest.name}: ${downloadedBytes / 1024}KB")
     }
 
-
     /**
      * Extracts a .zip file using Java ZipInputStream.
      * Android has no system 'unzip' command (runOrThrow("unzip"...) FAILS on Android).
@@ -473,7 +509,7 @@ class ProotInstaller @Inject constructor(
 
     /**
      * Removes all flag files to force a clean reinstall on next setup() call.
-     * Does NOT delete the rootfs (that would need re-download of 30MB+).
+     * Does NOT delete the rootfs (that would need re-download of ~30 MB).
      */
     fun resetFlags() {
         listOf(FLAG_ROOTFS, FLAG_DEPS, FLAG_DOTNET, FLAG_TSHOCK)
