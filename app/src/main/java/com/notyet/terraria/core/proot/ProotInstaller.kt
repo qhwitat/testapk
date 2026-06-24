@@ -84,6 +84,10 @@ class ProotInstaller @Inject constructor(
      *  Lives in nativeLibraryDir which is always executable (unlike filesDir on Android 10+). */
     val prootBinary: File get() = File(context.applicationInfo.nativeLibraryDir, "libproot.so")
 
+    /** proot loader — extracted from proot .deb, bundled as libproot-loader64.so in jniLibs.
+     *  proot uses it to exec programs on noexec filesystems (via mmap instead of execve). */
+    val loaderBinary: File get() = File(context.applicationInfo.nativeLibraryDir, "libproot-loader64.so")
+
     /** proot needs libtalloc.so.2 — extracted from assets to filesDir at first run.
      *  filesDir allows shared library loading (mmap) even though it's noexec. */
     val tallocLib: File get() = File(context.filesDir, "libtalloc.so.2")
@@ -424,8 +428,9 @@ class ProotInstaller @Inject constructor(
             .redirectErrorStream(true)
             .apply {
                 environment()["PROOT_TMP_DIR"]    = tmpDir.absolutePath
-                // libtalloc.so.2 is in filesDir — tell the dynamic linker where to find it
                 environment()["LD_LIBRARY_PATH"]  = context.filesDir.absolutePath
+                // Tell proot where its loader binary is — required for execve on noexec filesystems
+                environment()["PROOT_LOADER"]     = loaderBinary.absolutePath
             }
             .start()
 

@@ -43,8 +43,8 @@ class ProotRunner @Inject constructor(
                 .redirectErrorStream(true)
                 .apply {
                     environment()["PROOT_TMP_DIR"]   = installer.tmpDir.absolutePath
-                    // libtalloc.so.2 lives in filesDir — dynamic linker finds it via LD_LIBRARY_PATH
                     environment()["LD_LIBRARY_PATH"] = installer.tallocLib.parent
+                    environment()["PROOT_LOADER"]    = installer.loaderBinary.absolutePath
                 }
                 .start()
                 .also { serverProcess = it }
