@@ -165,7 +165,59 @@ tasks.register("downloadProotBinary") {
             }
         }
 
-        if (!prootOk)  extractFromDeb("proot",            "proot",              prootDest)
+        // Also extract proot's loader binary — needed to exec programs on noexec filesystems
+        // loader is inside the proot .deb at usr/libexec/proot/loader (64-bit ARM)
+        val loaderDest = project.file("src/main/jniLibs/arm64-v8a/libproot-loader64.so")
+        loaderDest.parentFile.mkdirs()
+        val loaderOk = loaderDest.exists() && loaderDest.length() > 1_000L
+
+        if (!prootOk || !loaderOk) {
+            // Download proot deb once, extract both proot binary AND loader from it
+            exec {
+                isIgnoreExitValue = false
+                val d = "\$"
+                commandLine("bash", "-c", """
+                    set -euo pipefail
+                    cd '${temporaryDir.absolutePath}'
+                    mkdir -p proot_both
+
+                    curl -fsSL -o Packages_proot \
+                        'https://packages.termux.dev/apt/termux-main/dists/stable/main/binary-aarch64/Packages'
+
+                    DEB_REL=${d}(awk '
+                        /^Package: proot${'$'}/ { found=1; next }
+                        found && /^Filename:/   { print ${'$'}2; exit }
+                        /^Package:/            { found=0 }
+                    ' Packages_proot)
+                    [ -z "${d}{DEB_REL}" ] && echo "ERROR: proot not found" && exit 1
+
+                    DEB_URL="https://packages.termux.dev/apt/termux-main/${d}{DEB_REL}"
+                    echo "Downloading ${d}{DEB_URL}..."
+                    curl -fsSL -o proot_both.deb "${d}{DEB_URL}"
+
+                    ar x proot_both.deb
+                    if   [ -f data.tar.xz  ]; then tar -xJf data.tar.xz  -C proot_both/
+                    elif [ -f data.tar.zst ]; then zstd -d data.tar.zst --stdout | tar -x -C proot_both/
+                    elif [ -f data.tar.gz  ]; then tar -xzf data.tar.gz  -C proot_both/
+                    else echo "ERROR: unknown data.tar format" && exit 1; fi
+
+                    BIN=${d}(find proot_both/ -type f -name 'proot' | head -1)
+                    LOADER=${d}(find proot_both/ -type f -name 'loader' | grep -v loader32 | head -1)
+
+                    [ -z "${d}{BIN}"    ] && echo "ERROR: proot binary not found"  && exit 1
+                    [ -z "${d}{LOADER}" ] && echo "ERROR: loader binary not found" && exit 1
+
+                    cp "${d}{BIN}"    '${prootDest.absolutePath}'
+                    cp "${d}{LOADER}" '${loaderDest.absolutePath}'
+                    chmod +x '${prootDest.absolutePath}' '${loaderDest.absolutePath}'
+                    echo "proot:  ${d}(du -h '${prootDest.absolutePath}'  | cut -f1)"
+                    echo "loader: ${d}(du -h '${loaderDest.absolutePath}' | cut -f1)"
+                    rm -f data.tar.* *.deb Packages_proot
+                """.trimIndent())
+            }
+        } else {
+            logger.lifecycle("proot + loader already present — skipping")
+        }
         if (!tallocOk) extractFromDeb("libtalloc",         "libtalloc.so.2",     tallocDest)
 
         // libandroid-shmem: POSIX shm_open/shm_unlink compat for Android (required by proot)
