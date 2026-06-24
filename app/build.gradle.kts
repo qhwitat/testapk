@@ -165,8 +165,14 @@ tasks.register("downloadProotBinary") {
             }
         }
 
-        if (!prootOk)  extractFromDeb("proot",     "proot",         prootDest)
-        if (!tallocOk) extractFromDeb("libtalloc", "libtalloc.so.2", tallocDest)
+        if (!prootOk)  extractFromDeb("proot",            "proot",              prootDest)
+        if (!tallocOk) extractFromDeb("libtalloc",         "libtalloc.so.2",     tallocDest)
+
+        // libandroid-shmem: POSIX shm_open/shm_unlink compat for Android (required by proot)
+        val shmemDest = project.file("src/main/assets/libandroid-shmem.so")
+        shmemDest.parentFile.mkdirs()
+        if (!shmemDest.exists() || shmemDest.length() < 1_000L)
+            extractFromDeb("libandroid-shmem", "libandroid-shmem.so", shmemDest)
     }
 }
 
