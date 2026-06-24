@@ -130,21 +130,30 @@ class ProotInstaller @Inject constructor(
     // filesDir is noexec (can't run binaries) but CAN be used for mmap/dlopen (.so loading).
 
     private fun step1_PrepareTalloc(onProgress: (String) -> Unit) {
-        if (tallocLib.exists() && tallocLib.length() > 10_000L) {
-            Log.d(TAG, "libtalloc.so.2 already in filesDir, skipping")
+        // proot from Termux is dynamically linked against these non-system libraries.
+        // They can't go in jniLibs (naming doesn't match lib*.so pattern for versioned files).
+        // Solution: bundle in assets → extract to filesDir → LD_LIBRARY_PATH at exec time.
+        val libs = listOf("libtalloc.so.2", "libandroid-shmem.so")
+        val missing = libs.filter {
+            val f = File(context.filesDir, it)
+            !f.exists() || f.length() < 1_000L
+        }
+        if (missing.isEmpty()) {
+            Log.d(TAG, "proot libs already in filesDir, skipping")
             return
         }
         onProgress("Preparing proot dependencies…")
-        try {
-            context.assets.open("libtalloc.so.2").use { src ->
-                FileOutputStream(tallocLib).use { dst -> src.copyTo(dst) }
+        for (name in missing) {
+            try {
+                context.assets.open(name).use { src ->
+                    FileOutputStream(File(context.filesDir, name)).use { dst -> src.copyTo(dst) }
+                }
+                Log.i(TAG, "$name extracted → ${context.filesDir}/$name")
+            } catch (e: IOException) {
+                throw RuntimeException(
+                    "$name not found in APK assets — rebuild with latest downloadProotBinary task", e
+                )
             }
-            Log.i(TAG, "libtalloc.so.2 extracted → ${tallocLib.absolutePath}")
-        } catch (e: IOException) {
-            throw RuntimeException(
-                "libtalloc.so.2 not found in APK assets. " +
-                "Ensure the downloadProotBinary Gradle task ran successfully.", e
-            )
         }
     }
 
