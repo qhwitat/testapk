@@ -208,8 +208,18 @@ class ProotInstaller @Inject constructor(
 
     private fun step3_InstallDeps(onProgress: (String) -> Unit) {
         if (flag(FLAG_DEPS).exists()) {
-            Log.d(TAG, "System deps already installed, skipping")
-            return
+            // Verify libicu-dev is actually present — flag may have been set from a
+            // previous failed run (e.g. when proot loader was missing and apt never ran).
+            val icuCheck = runInProot(
+                "find /usr/lib -name 'libicuuc.so*' 2>/dev/null | head -1"
+            ).trim()
+            if (icuCheck.isNotEmpty()) {
+                Log.d(TAG, "System deps verified (libicu found: $icuCheck), skipping")
+                return
+            }
+            // Flag is stale — libicu missing, must reinstall
+            flag(FLAG_DEPS).delete()
+            Log.w(TAG, "FLAG_DEPS was stale (libicu not found) — reinstalling deps")
         }
         onProgress("Installing system dependencies (libicu-dev, wget)…")
 
@@ -277,8 +287,13 @@ class ProotInstaller @Inject constructor(
 
     private fun step5_InstallTShock(onProgress: (String) -> Unit) {
         if (flag(FLAG_TSHOCK).exists()) {
-            Log.d(TAG, "TShock already installed, skipping")
-            return
+            val serverBin = File(tshockDir, "TShock.Server")
+            if (serverBin.exists()) {
+                Log.d(TAG, "TShock already installed, skipping")
+                return
+            }
+            flag(FLAG_TSHOCK).delete()
+            Log.w(TAG, "FLAG_TSHOCK was stale (TShock.Server missing) — reinstalling")
         }
 
         onProgress("Fetching latest TShock linux-arm64 release…")
@@ -351,6 +366,9 @@ class ProotInstaller @Inject constructor(
         val startScript = File(tshockDir, "start.sh")
         startScript.writeText(buildString {
             appendLine("#!/bin/bash")
+            appendLine()
+            appendLine("# ── PATH — ubuntu-base minimal env has no default PATH ──")
+            appendLine("export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
             appendLine()
             appendLine("# ── .NET 9 Runtime (manual install to ~/.dotnet) ─────────")
             appendLine("export DOTNET_ROOT=/root/.dotnet")
