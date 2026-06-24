@@ -107,71 +107,69 @@ dependencies {
 // ─────────────────────────────────────────────────────────────────────────────
 
 tasks.register("downloadProotBinary") {
-    description = "Downloads proot aarch64 static binary from Termux packages into jniLibs"
+    description = "Downloads proot + libtalloc from Termux packages (jniLibs + assets)"
     group       = "setup"
 
-    val prootAsset = project.file("src/main/jniLibs/arm64-v8a/libproot.so")
-    outputs.file(prootAsset)
+    val prootDest  = project.file("src/main/jniLibs/arm64-v8a/libproot.so")
+    val tallocDest = project.file("src/main/assets/libtalloc.so.2")
+    outputs.files(prootDest, tallocDest)
 
     doLast {
-        if (prootAsset.exists() && prootAsset.length() > 100_000L) {
-            logger.lifecycle("✅ proot already in jniLibs (${prootAsset.length() / 1024} KB) — skipping")
+        val prootOk  = prootDest.exists()  && prootDest.length()  > 100_000L
+        val tallocOk = tallocDest.exists() && tallocDest.length() >  10_000L
+        if (prootOk && tallocOk) {
+            logger.lifecycle("proot + libtalloc already present — skipping")
             return@doLast
         }
-        prootAsset.parentFile.mkdirs()
+        prootDest.parentFile.mkdirs()
+        tallocDest.parentFile.mkdirs()
 
-        val tmp  = temporaryDir.also { it.mkdirs() }
-        val dest = prootAsset.absolutePath
-        val d    = "\$"    // dollar sign — Kotlin triple-quote can't include $ directly
+        val tmp = temporaryDir.also { it.mkdirs() }
+        val d   = "\$"
 
-        exec {
-            isIgnoreExitValue = false
-            commandLine("bash", "-c", """
-                set -euo pipefail
-                cd '${tmp.absolutePath}'
+        fun extractFromDeb(pkgName: String, findName: String, outFile: java.io.File) {
+            exec {
+                isIgnoreExitValue = false
+                commandLine("bash", "-c", """
+                    set -euo pipefail
+                    cd '${tmp.absolutePath}'
+                    mkdir -p ${pkgName}_ext
 
-                echo "▶ Querying latest proot version from Termux packages…"
-                curl -fsSL -o Packages \
-                    'https://packages.termux.dev/apt/termux-main/dists/stable/main/binary-aarch64/Packages'
+                    curl -fsSL -o Packages_${pkgName} \
+                        'https://packages.termux.dev/apt/termux-main/dists/stable/main/binary-aarch64/Packages'
 
-                DEB_REL=${d}(awk '
-                    /^Package: proot${d}/   { found=1; next }
-                    found && /^Filename:/   { print ${d}2; exit }
-                    /^${d}/                 { found=0 }
-                ' Packages)
+                    DEB_REL=${d}(awk '
+                        /^Package: ${pkgName}${'$'}/ { found=1; next }
+                        found && /^Filename:/        { print ${'$'}2; exit }
+                        /^Package:/                  { found=0 }
+                    ' Packages_${pkgName})
+                    [ -z "${d}{DEB_REL}" ] && echo "ERROR: ${pkgName} not found" && exit 1
 
-                [ -z "${d}DEB_REL" ] && echo "ERROR: proot not found in Termux package list" && exit 1
+                    DEB_URL="https://packages.termux.dev/apt/termux-main/${d}{DEB_REL}"
+                    curl -fsSL -o ${pkgName}.deb "${d}{DEB_URL}"
 
-                DEB_URL="https://packages.termux.dev/apt/termux-main/${d}{DEB_REL}"
-                echo "▶ Downloading ${d}{DEB_URL}…"
-                curl -fsSL -o proot.deb "${d}{DEB_URL}"
+                    ar x ${pkgName}.deb
+                    if   [ -f data.tar.xz  ]; then tar -xJf data.tar.xz  -C ${pkgName}_ext/
+                    elif [ -f data.tar.zst ]; then zstd -d data.tar.zst --stdout | tar -x -C ${pkgName}_ext/
+                    elif [ -f data.tar.gz  ]; then tar -xzf data.tar.gz  -C ${pkgName}_ext/
+                    else echo "ERROR: unknown data.tar format" && exit 1; fi
 
-                echo "▶ Extracting binary from .deb…"
-                mkdir -p extracted
-                ar x proot.deb
+                    BIN=${d}(find ${pkgName}_ext/ -name '${findName}' | head -1)
+                    [ -z "${d}{BIN}" ] && echo "ERROR: ${findName} not found" && exit 1
 
-                if   [ -f data.tar.xz  ]; then
-                    tar -xJf  data.tar.xz  -C extracted/
-                elif [ -f data.tar.zst ]; then
-                    command -v zstd >/dev/null 2>&1 \
-                        || { echo "ERROR: zstd needed — brew install zstd / sudo apt install zstd"; exit 1; }
-                    zstd -d data.tar.zst --stdout | tar -x -C extracted/
-                elif [ -f data.tar.gz  ]; then
-                    tar -xzf  data.tar.gz  -C extracted/
-                else
-                    echo "ERROR: unknown data.tar format in .deb" && exit 1
-                fi
-
-                BIN=${d}(find extracted/ -type f -name proot | head -1)
-                [ -z "${d}BIN" ] && echo "ERROR: proot binary not found after extraction" && exit 1
-
-                cp "${d}BIN" '$dest'
-                chmod +x '$dest'
-                echo "✅ libproot.so ready: $dest (${d}(du -h '$dest' | cut -f1))"
-            """.trimIndent())
+                    cp "${d}{BIN}" '${outFile.absolutePath}'
+                    chmod +x '${outFile.absolutePath}'
+                    echo "Done: ${findName} (${d}(du -h '${outFile.absolutePath}' | cut -f1))"
+                    rm -f data.tar.* *.deb Packages_${pkgName}
+                """.trimIndent())
+            }
         }
+
+        if (!prootOk)  extractFromDeb("proot",     "proot",         prootDest)
+        if (!tallocOk) extractFromDeb("libtalloc", "libtalloc.so.2", tallocDest)
     }
 }
+
 
 // Auto-download proot before every build — safe to run repeatedly (idempotent)
 tasks.named("preBuild").configure {
