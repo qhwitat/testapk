@@ -15,7 +15,9 @@ import javax.inject.Singleton
  * Manages the one-time installation of the Linux environment needed to run TShock.
  *
  * Layers installed (in order):
- *  1. proot binary   → extracted from APK assets (bundled at build time, ~229 KB)
+ *  1. proot binary   → installed automatically via jniLibs/arm64-v8a/libproot.so
+ *                       Android extracts it to nativeLibraryDir at APK install time
+ *                       (filesDir is noexec on Android 10+ — jniLibs is always executable)
  *  2. Ubuntu rootfs  → downloaded from Ubuntu official base images, 22.04 LTS ARM64 (~30 MB)
  *  3. System deps    → libicu-dev + wget via apt inside proot (ICU is required by .NET)
  *  4. .NET 9 Runtime → downloaded manually to /root/.dotnet (apt doesn't have it reliably)
@@ -78,8 +80,9 @@ class ProotInstaller @Inject constructor(
     /** Root of the Ubuntu Linux filesystem inside app storage */
     val rootfsDir: File get() = File(context.filesDir, "ubuntu")
 
-    /** proot binary extracted from APK assets */
-    val prootBinary: File get() = File(context.filesDir, "proot")
+    /** proot binary — installed by Android from jniLibs/arm64-v8a/libproot.so at APK install time.
+     *  Lives in nativeLibraryDir which is always executable (unlike filesDir on Android 10+). */
+    val prootBinary: File get() = File(context.applicationInfo.nativeLibraryDir, "libproot.so")
 
     /** Temp directory for proot internal use */
     val tmpDir: File get() = File(context.cacheDir, "proot_tmp").also { it.mkdirs() }
@@ -106,7 +109,10 @@ class ProotInstaller @Inject constructor(
      * @param onProgress called with human-readable status strings for UI display
      */
     suspend fun setup(onProgress: (String) -> Unit) = withContext(Dispatchers.IO) {
-        step1_ExtractProot(onProgress)
+        // step1 removed — proot is in nativeLibraryDir, extracted automatically at APK install
+        if (!prootBinary.exists()) throw RuntimeException(
+            "proot not found at ${prootBinary.absolutePath} — reinstall the APK"
+        )
         step2_DownloadRootfs(onProgress)
         step3_InstallDeps(onProgress)
         step4_InstallDotnet(onProgress)
@@ -114,28 +120,6 @@ class ProotInstaller @Inject constructor(
         step6_WriteStartScript()
         onProgress("✅ Setup complete — ready to start server")
         Log.i(TAG, "Full setup complete")
-    }
-
-    // ── Step 1: Extract proot binary from APK assets ─────────────────────────
-
-    private fun step1_ExtractProot(onProgress: (String) -> Unit) {
-        if (prootBinary.exists() && prootBinary.canExecute()) {
-            Log.d(TAG, "proot already extracted, skipping")
-            return
-        }
-        onProgress("Extracting proot binary…")
-        try {
-            context.assets.open("proot").use { src ->
-                FileOutputStream(prootBinary).use { dst -> src.copyTo(dst) }
-            }
-            prootBinary.setExecutable(true, false)
-            Log.i(TAG, "proot extracted → ${prootBinary.absolutePath}")
-        } catch (e: IOException) {
-            throw RuntimeException(
-                "proot binary not found in APK assets. " +
-                "Ensure proot (ARM64) is placed in app/src/main/assets/proot", e
-            )
-        }
     }
 
     // ── Step 2: Download Ubuntu ARM64 rootfs ──────────────────────────────────
@@ -550,7 +534,7 @@ class ProotInstaller @Inject constructor(
     fun fullReset() {
         resetFlags()
         rootfsDir.deleteRecursively()
-        prootBinary.delete()
+        // NOTE: prootBinary is in nativeLibraryDir — managed by Android, cannot delete manually
         Log.w(TAG, "Full reset complete")
     }
 }
