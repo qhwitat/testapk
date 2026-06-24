@@ -42,6 +42,16 @@ android {
         compose = true
     }
 
+    packaging {
+        jniLibs {
+            // Extract .so files to nativeLibraryDir at install time (required for exec)
+            // Without this, proot stays compressed inside APK and can't be run
+            useLegacyPackaging = true
+            // Don't strip libproot.so — it's a pre-built executable, not a real .so
+            keepDebugSymbols += "**/libproot.so"
+        }
+    }
+
     // ❌ composeOptions { kotlinCompilerExtensionVersion = "1.5.1" } ← REMOVED
     // With Kotlin 2.0 + org.jetbrains.kotlin.plugin.compose, the compiler
     // is bundled — setting kotlinCompilerExtensionVersion causes a build crash.
@@ -78,7 +88,12 @@ dependencies {
 // ─────────────────────────────────────────────────────────────────────────────
 // Task: downloadProotBinary
 // Downloads the proot ARM64 static binary from Termux packages and places it
-// in src/main/assets/proot — required by ProotInstaller.step1.
+// in src/main/jniLibs/arm64-v8a/libproot.so
+//
+// Why jniLibs and not assets?
+//   Android 10+ mounts filesDir with noexec — binaries extracted from assets
+//   to filesDir get "Permission denied" (error=13) when executed.
+//   jniLibs are extracted to nativeLibraryDir which is always executable.
 //
 // Runs automatically before every build (preBuild dependency below).
 // Skips silently if the binary is already present (idempotent).
@@ -92,15 +107,15 @@ dependencies {
 // ─────────────────────────────────────────────────────────────────────────────
 
 tasks.register("downloadProotBinary") {
-    description = "Downloads proot aarch64 static binary from Termux packages into assets"
+    description = "Downloads proot aarch64 static binary from Termux packages into jniLibs"
     group       = "setup"
 
-    val prootAsset = project.file("src/main/assets/proot")
+    val prootAsset = project.file("src/main/jniLibs/arm64-v8a/libproot.so")
     outputs.file(prootAsset)
 
     doLast {
         if (prootAsset.exists() && prootAsset.length() > 100_000L) {
-            logger.lifecycle("✅ proot already in assets (${prootAsset.length() / 1024} KB) — skipping")
+            logger.lifecycle("✅ proot already in jniLibs (${prootAsset.length() / 1024} KB) — skipping")
             return@doLast
         }
         prootAsset.parentFile.mkdirs()
@@ -152,7 +167,7 @@ tasks.register("downloadProotBinary") {
 
                 cp "${d}BIN" '$dest'
                 chmod +x '$dest'
-                echo "✅ proot ready: $dest (${d}(du -h '$dest' | cut -f1))"
+                echo "✅ libproot.so ready: $dest (${d}(du -h '$dest' | cut -f1))"
             """.trimIndent())
         }
     }
