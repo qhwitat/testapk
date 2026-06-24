@@ -156,9 +156,11 @@ class ProotInstaller @Inject constructor(
             }
 
             onProgress("Extracting Ubuntu rootfs… (may take a minute)")
-            // --no-same-owner: Android process cannot chown files → tar exits 1 without this
+            // --no-same-owner: Android process cannot chown files
             // No --strip-components: ubuntu-base has files at root level (no wrapper dir)
-            runOrThrow(
+            // runTarOrWarn: exit 1 = non-fatal (hard links across dirs not allowed on Android)
+            // hard link failures (perl5.34.0→perl, uncompress→gunzip) are irrelevant for TShock
+            runTarOrWarn(
                 "tar", "-xzf", tarball.absolutePath,
                 "-C", rootfsDir.absolutePath,
                 "--no-same-owner"
@@ -228,7 +230,7 @@ class ProotInstaller @Inject constructor(
 
             // Extract directly into rootfs at /root/.dotnet
             // Note: we extract to the host path which maps to /root/.dotnet inside proot
-            runOrThrow(
+            runTarOrWarn(
                 "tar", "-xzf", tarball.absolutePath,
                 "-C", dotnetDir.absolutePath,
                 "--no-same-owner"
@@ -284,7 +286,7 @@ class ProotInstaller @Inject constructor(
                 )
 
             tshockDir.mkdirs()
-            runOrThrow(
+            runTarOrWarn(
                 "tar", "-xf", innerTar.absolutePath,
                 "-C", tshockDir.absolutePath,
                 "--no-same-owner"
@@ -484,6 +486,31 @@ class ProotInstaller @Inject constructor(
                 zis.closeEntry()
                 entry = zis.nextEntry
             }
+        }
+    }
+
+    /**
+     * Runs a tar extraction command, treating exit code 1 as non-fatal warnings.
+     *
+     * GNU tar / toybox tar exit codes:
+     *   0 = success
+     *   1 = some entries had warnings (hard links across dirs, chown errors, etc.)
+     *   2 = fatal error (corrupt archive, missing file, etc.)
+     *
+     * Android does NOT allow hard links across directories → ubuntu-base tarballs
+     * produce exit 1 for entries like perl5.34.0→perl, uncompress→gunzip.
+     * These are irrelevant for TShock — we only need bash, apt, libicu.
+     */
+    private fun runTarOrWarn(vararg cmd: String) {
+        val process = ProcessBuilder(*cmd).redirectErrorStream(true).start()
+        val output = process.inputStream.bufferedReader().readText()
+        val exit = process.waitFor()
+        when {
+            exit == 0 -> Log.d(TAG, "tar → exit 0")
+            exit == 1 -> Log.w(TAG, "tar completed with non-fatal warnings: ${output.take(300)}")
+            else -> throw RuntimeException(
+                "Command '${cmd.first()}' failed fatally (exit $exit):\n${output.take(500)}"
+            )
         }
     }
 
