@@ -1,8 +1,6 @@
 name: Build APK
 
 on:
-  push:
-    branches: [main, master]
   workflow_dispatch:
 
 # ── SDK path ثابت على كل ubuntu-latest runner ────────────────────────────────
