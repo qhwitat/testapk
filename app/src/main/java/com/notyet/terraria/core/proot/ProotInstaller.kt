@@ -103,12 +103,27 @@ class ProotInstaller @Inject constructor(
     // ── Public API ────────────────────────────────────────────────────────────
 
     /** True only when all 5 installation steps are complete */
-    fun isFullyInstalled(): Boolean =
-        prootBinary.exists() && prootBinary.canExecute() &&
-        flag(FLAG_ROOTFS).exists()  &&
-        flag(FLAG_DEPS).exists()    &&
-        flag(FLAG_DOTNET).exists()  &&
-        flag(FLAG_TSHOCK).exists()
+    fun isFullyInstalled(): Boolean {
+        if (!prootBinary.exists()) return false
+        if (!loaderBinary.exists()) return false
+        if (listOf(FLAG_ROOTFS, FLAG_DEPS, FLAG_DOTNET, FLAG_TSHOCK).any { !flag(it).exists() }) return false
+
+        // Verify libicu is ACTUALLY installed — FLAG_DEPS can be stale from a failed run
+        // (e.g. set before proot loader was fixed, when apt-get never actually ran)
+        // Check on host filesystem: no proot needed, fast
+        val icuPresent = File(rootfsDir, "usr/lib/aarch64-linux-gnu")
+            .takeIf { it.isDirectory }
+            ?.listFiles()
+            ?.any { it.name.startsWith("libicuuc.so") }
+            ?: false
+
+        if (!icuPresent) {
+            flag(FLAG_DEPS).delete()
+            Log.w(TAG, "isFullyInstalled: libicu missing — resetting FLAG_DEPS for reinstall")
+            return false
+        }
+        return true
+    }
 
     /**
      * Runs the full installation pipeline.
@@ -207,38 +222,49 @@ class ProotInstaller @Inject constructor(
     // ── Step 3: Install system deps inside proot ─────────────────────────────
 
     private fun step3_InstallDeps(onProgress: (String) -> Unit) {
-        if (flag(FLAG_DEPS).exists()) {
-            // Verify libicu-dev is actually present — flag may have been set from a
-            // previous failed run (e.g. when proot loader was missing and apt never ran).
-            val icuCheck = runInProot(
-                "find /usr/lib -name 'libicuuc.so*' 2>/dev/null | head -1"
-            ).trim()
-            if (icuCheck.isNotEmpty()) {
-                Log.d(TAG, "System deps verified (libicu found: $icuCheck), skipping")
-                return
-            }
-            // Flag is stale — libicu missing, must reinstall
-            flag(FLAG_DEPS).delete()
-            Log.w(TAG, "FLAG_DEPS was stale (libicu not found) — reinstalling deps")
-        }
-        onProgress("Installing system dependencies (libicu-dev, wget)…")
+        fun icuOk() = File(rootfsDir, "usr/lib/aarch64-linux-gnu")
+            .takeIf { it.isDirectory }
+            ?.listFiles()?.any { it.name.startsWith("libicuuc.so") } ?: false
 
-        // Two-pass install:
-        //   Pass 1: install ca-certificates with --allow-unauthenticated (no valid certs yet)
-        //           then run update-ca-certificates
-        //   Pass 2: apt-get update with valid certs, then install libicu-dev
-        // libicu-dev = REQUIRED for .NET 9 / TShock — crashes without it
-        val output = runInProot(
-            "apt-get update -qq --allow-unauthenticated 2>&1 | tail -2 && " +
-            "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends " +
-            "  --allow-unauthenticated ca-certificates 2>&1 | tail -3 && " +
-            "update-ca-certificates 2>&1 | tail -2 && " +
-            "apt-get update -qq 2>&1 | tail -2 && " +
-            "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends " +
-            "  libicu-dev wget 2>&1 | tail -5"
+        if (flag(FLAG_DEPS).exists()) {
+            if (icuOk()) { Log.d(TAG, "System deps verified, skipping"); return }
+            flag(FLAG_DEPS).delete()
+            Log.w(TAG, "FLAG_DEPS stale — libicu missing, reinstalling")
+        }
+
+        // Strategy: download .deb directly on Android host (reliable network),
+        // extract via dpkg-deb inside proot. Avoids apt-get inside proot (unreliable on Android).
+        //
+        // libicu70 (Ubuntu 22.04 LTS ARM64) — stable URL until April 2027
+        // Contains: libicuuc.so.70, libicudata.so.70, libicui18n.so.70
+        // These are exactly what .NET 9 needs (searches for libicuuc.so.*)
+        val debUrl  = "https://ports.ubuntu.com/ubuntu-ports/pool/main/i/icu/libicu70_70.1-2_arm64.deb"
+        val debName = "libicu70.deb"
+
+        val debAndroid  = File(context.cacheDir, debName)
+        val debInRootfs = File(rootfsDir, "tmp/$debName")
+        File(rootfsDir, "tmp").mkdirs()
+
+        try {
+            onProgress("Downloading libicu70… (~33 MB)")
+            download(debUrl, debAndroid) { pct -> onProgress("Downloading libicu70… $pct%") }
+            debAndroid.copyTo(debInRootfs, overwrite = true)
+
+            onProgress("Installing libicu70 via dpkg-deb…")
+            val out = runInProot("dpkg-deb -x /tmp/$debName / 2>&1")
+            Log.i(TAG, "dpkg-deb: ${out.take(200)}")
+
+            runInProot("ldconfig 2>&1 | head -3")
+        } finally {
+            debAndroid.delete()
+            debInRootfs.delete()
+        }
+
+        if (!icuOk()) throw RuntimeException(
+            "libicu70 installation failed — libicuuc.so not found after dpkg-deb extraction."
         )
-        Log.i(TAG, "apt output: $output")
         flag(FLAG_DEPS).createNewFile()
+        Log.i(TAG, "libicu70 installed successfully")
     }
 
     // ── Step 4: Install .NET 9 Runtime manually ───────────────────────────────
@@ -367,12 +393,23 @@ class ProotInstaller @Inject constructor(
         startScript.writeText(buildString {
             appendLine("#!/bin/bash")
             appendLine()
+            appendLine("# ── Core env — ubuntu-base has empty environment ─────────")
+            appendLine("export HOME=/root")
+            appendLine("export TMPDIR=/tmp")
+            appendLine("export TERM=dumb")
+            appendLine("export LANG=C.UTF-8")
+            appendLine()
             appendLine("# ── PATH — ubuntu-base minimal env has no default PATH ──")
             appendLine("export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
             appendLine()
             appendLine("# ── .NET 9 Runtime (manual install to ~/.dotnet) ─────────")
             appendLine("export DOTNET_ROOT=/root/.dotnet")
             appendLine("export PATH=\"\$PATH:/root/.dotnet\"")
+            appendLine()
+            appendLine("# ── ICU library path — .NET uses dlopen to find libicuuc ─")
+            appendLine("# ldconfig cache may not be populated inside proot on Android")
+            appendLine("# Point LD_LIBRARY_PATH directly so dlopen succeeds")
+            appendLine("export LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu:\$LD_LIBRARY_PATH")
             appendLine()
             appendLine("# ── GC settings — required for ARM64 Android stability ───")
             appendLine("# Server GC is tuned for datacenter multi-core, not mobile")
@@ -408,7 +445,16 @@ class ProotInstaller @Inject constructor(
      */
     private fun resolveTShockDownloadUrl(): String {
         val json = try {
-            URL(TSHOCK_API).readText()
+            val conn = (URL(TSHOCK_API).openConnection() as java.net.HttpURLConnection).apply {
+                connectTimeout = 15_000
+                readTimeout    = 30_000
+                setRequestProperty("Accept", "application/vnd.github.v3+json")
+                setRequestProperty("User-Agent", "NoyetTerrariaHost/1.0")
+                connect()
+            }
+            if (conn.responseCode !in 200..299)
+                throw RuntimeException("GitHub API returned HTTP ${conn.responseCode}")
+            conn.inputStream.bufferedReader().readText().also { conn.disconnect() }
         } catch (e: Exception) {
             throw RuntimeException("Failed to fetch TShock release info: ${e.message}", e)
         }
@@ -439,7 +485,9 @@ class ProotInstaller @Inject constructor(
             "-b", "/proc",
             "-b", "/sys",
             "-w", "/root",
-            "/bin/bash", "-c", bashCommand
+            "/bin/bash", "-c",
+            // ubuntu-base minimal env — set essentials before every command
+            "export HOME=/root TMPDIR=/tmp TERM=dumb LANG=C.UTF-8; $bashCommand"
         )
 
         val process = ProcessBuilder(cmd)
@@ -468,7 +516,7 @@ class ProotInstaller @Inject constructor(
     private fun download(url: String, dest: File, onProgress: (Int) -> Unit = {}) {
         var connection = URL(url).openConnection() as HttpURLConnection
         connection.connectTimeout = 30_000
-        connection.readTimeout    = 60_000
+        connection.readTimeout    = 120_000   // 2 min — enough for large files on mobile
         connection.instanceFollowRedirects = false
         connection.connect()
 

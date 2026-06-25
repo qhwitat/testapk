@@ -45,6 +45,11 @@ class ProotRunner @Inject constructor(
                     environment()["PROOT_TMP_DIR"]   = installer.tmpDir.absolutePath
                     environment()["LD_LIBRARY_PATH"] = installer.tallocLib.parent
                     environment()["PROOT_LOADER"]    = installer.loaderBinary.absolutePath
+                    // ubuntu-base has empty environment — set essentials for TShock/bash
+                    environment()["HOME"]            = "/root"
+                    environment()["TMPDIR"]          = "/tmp"
+                    environment()["TERM"]            = "dumb"
+                    environment()["LANG"]            = "C.UTF-8"
                 }
                 .start()
                 .also { serverProcess = it }
