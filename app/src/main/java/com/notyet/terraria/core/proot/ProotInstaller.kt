@@ -106,23 +106,7 @@ class ProotInstaller @Inject constructor(
     fun isFullyInstalled(): Boolean {
         if (!prootBinary.exists()) return false
         if (!loaderBinary.exists()) return false
-        if (listOf(FLAG_ROOTFS, FLAG_DEPS, FLAG_DOTNET, FLAG_TSHOCK).any { !flag(it).exists() }) return false
-
-        // Verify libicu is ACTUALLY installed — FLAG_DEPS can be stale from a failed run
-        // (e.g. set before proot loader was fixed, when apt-get never actually ran)
-        // Check on host filesystem: no proot needed, fast
-        val icuPresent = File(rootfsDir, "usr/lib/aarch64-linux-gnu")
-            .takeIf { it.isDirectory }
-            ?.listFiles()
-            ?.any { it.name.startsWith("libicuuc.so") }
-            ?: false
-
-        if (!icuPresent) {
-            flag(FLAG_DEPS).delete()
-            Log.w(TAG, "isFullyInstalled: libicu missing — resetting FLAG_DEPS for reinstall")
-            return false
-        }
-        return true
+        return listOf(FLAG_ROOTFS, FLAG_DOTNET, FLAG_TSHOCK).all { flag(it).exists() }
     }
 
     /**
@@ -134,7 +118,7 @@ class ProotInstaller @Inject constructor(
     suspend fun setup(onProgress: (String) -> Unit) = withContext(Dispatchers.IO) {
         step1_PrepareTalloc(onProgress)
         step2_DownloadRootfs(onProgress)
-        step3_InstallDeps(onProgress)
+        // step3 removed — libicu not needed, DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1 in start.sh
         step4_InstallDotnet(onProgress)
         step5_InstallTShock(onProgress)
         step6_WriteStartScript()
@@ -410,6 +394,12 @@ class ProotInstaller @Inject constructor(
             appendLine("# ldconfig cache may not be populated inside proot on Android")
             appendLine("# Point LD_LIBRARY_PATH directly so dlopen succeeds")
             appendLine("export LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu:\$LD_LIBRARY_PATH")
+            appendLine()
+            appendLine("# ── ICU / Globalization ───────────────────────────────────")
+            appendLine("# .NET 9 looks for libicuuc.so — not installed in minimal rootfs.")
+            appendLine("# Invariant mode bypasses ICU entirely. TShock game logic doesn't")
+            appendLine("# need locale-sensitive string operations.")
+            appendLine("export DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1")
             appendLine()
             appendLine("# ── GC settings — required for ARM64 Android stability ───")
             appendLine("# Server GC is tuned for datacenter multi-core, not mobile")
