@@ -106,7 +106,20 @@ class ProotInstaller @Inject constructor(
     fun isFullyInstalled(): Boolean {
         if (!prootBinary.exists()) return false
         if (!loaderBinary.exists()) return false
-        return listOf(FLAG_ROOTFS, FLAG_DOTNET, FLAG_TSHOCK).all { flag(it).exists() }
+        if (listOf(FLAG_ROOTFS, FLAG_DEPS, FLAG_DOTNET, FLAG_TSHOCK).any { !flag(it).exists() }) return false
+
+        // FLAG_DEPS now means "ICU installed" — verify libicuuc.so is actually present,
+        // flag can be stale from an interrupted or earlier-failed run
+        val icuPresent = File(rootfsDir, "usr/lib/aarch64-linux-gnu")
+            .takeIf { it.isDirectory }
+            ?.listFiles()?.any { it.name.startsWith("libicuuc.so") } ?: false
+
+        if (!icuPresent) {
+            flag(FLAG_DEPS).delete()
+            Log.w(TAG, "isFullyInstalled: ICU missing — resetting FLAG_DEPS for reinstall")
+            return false
+        }
+        return true
     }
 
     /**
@@ -118,7 +131,7 @@ class ProotInstaller @Inject constructor(
     suspend fun setup(onProgress: (String) -> Unit) = withContext(Dispatchers.IO) {
         step1_PrepareTalloc(onProgress)
         step2_DownloadRootfs(onProgress)
-        // step3 removed — libicu not needed, DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1 in start.sh
+        step3_InstallIcu(onProgress)
         step4_InstallDotnet(onProgress)
         step5_InstallTShock(onProgress)
         step6_WriteStartScript()
@@ -203,52 +216,55 @@ class ProotInstaller @Inject constructor(
         }
     }
 
-    // ── Step 3: Install system deps inside proot ─────────────────────────────
+    // ── Step 3: Install real ICU libraries ────────────────────────────────────
+    // icu-libs.tar.gz is bundled in APK assets, pre-extracted at BUILD TIME
+    // (Gradle task downloadIcuLibs — see build.gradle.kts) from Ubuntu's
+    // official libicu70 package. Extraction here is a plain `tar` on the
+    // Android HOST filesystem — same proven code path as rootfs/.NET/TShock.
+    // No proot, no dpkg-deb: those failed silently in earlier attempts.
+    //
+    // NOTE: DOTNET_SYSTEM_GLOBALIZATION_INVARIANT is NOT used — Terraria's
+    // LanguageManager hard-codes CultureInfo("en-US"), which invariant mode
+    // cannot create. Real ICU is required, not optional.
 
-    private fun step3_InstallDeps(onProgress: (String) -> Unit) {
+    private fun step3_InstallIcu(onProgress: (String) -> Unit) {
         fun icuOk() = File(rootfsDir, "usr/lib/aarch64-linux-gnu")
             .takeIf { it.isDirectory }
             ?.listFiles()?.any { it.name.startsWith("libicuuc.so") } ?: false
 
         if (flag(FLAG_DEPS).exists()) {
-            if (icuOk()) { Log.d(TAG, "System deps verified, skipping"); return }
+            if (icuOk()) { Log.d(TAG, "ICU libs verified, skipping"); return }
             flag(FLAG_DEPS).delete()
             Log.w(TAG, "FLAG_DEPS stale — libicu missing, reinstalling")
         }
 
-        // Strategy: download .deb directly on Android host (reliable network),
-        // extract via dpkg-deb inside proot. Avoids apt-get inside proot (unreliable on Android).
-        //
-        // libicu70 (Ubuntu 22.04 LTS ARM64) — stable URL until April 2027
-        // Contains: libicuuc.so.70, libicudata.so.70, libicui18n.so.70
-        // These are exactly what .NET 9 needs (searches for libicuuc.so.*)
-        val debUrl  = "https://ports.ubuntu.com/ubuntu-ports/pool/main/i/icu/libicu70_70.1-2_arm64.deb"
-        val debName = "libicu70.deb"
-
-        val debAndroid  = File(context.cacheDir, debName)
-        val debInRootfs = File(rootfsDir, "tmp/$debName")
-        File(rootfsDir, "tmp").mkdirs()
+        onProgress("Installing ICU libraries…")
+        val targetDir = File(rootfsDir, "usr/lib/aarch64-linux-gnu").apply { mkdirs() }
+        val tarball = File(context.cacheDir, "icu-libs.tar.gz")
 
         try {
-            onProgress("Downloading libicu70… (~33 MB)")
-            download(debUrl, debAndroid) { pct -> onProgress("Downloading libicu70… $pct%") }
-            debAndroid.copyTo(debInRootfs, overwrite = true)
-
-            onProgress("Installing libicu70 via dpkg-deb…")
-            val out = runInProot("dpkg-deb -x /tmp/$debName / 2>&1")
-            Log.i(TAG, "dpkg-deb: ${out.take(200)}")
-
-            runInProot("ldconfig 2>&1 | head -3")
+            context.assets.open("icu-libs.tar.gz").use { src ->
+                FileOutputStream(tarball).use { dst -> src.copyTo(dst) }
+            }
+            // Plain host-level tar — proven reliable (same as rootfs/dotnet/tshock steps)
+            runTarOrWarn(
+                "tar", "-xzf", tarball.absolutePath,
+                "-C", targetDir.absolutePath,
+                "--no-same-owner"
+            )
+        } catch (e: IOException) {
+            throw RuntimeException(
+                "icu-libs.tar.gz not found in APK assets — rebuild with latest downloadIcuLibs task", e
+            )
         } finally {
-            debAndroid.delete()
-            debInRootfs.delete()
+            tarball.delete()
         }
 
         if (!icuOk()) throw RuntimeException(
-            "libicu70 installation failed — libicuuc.so not found after dpkg-deb extraction."
+            "ICU install failed — libicuuc.so not found in $targetDir after extraction."
         )
         flag(FLAG_DEPS).createNewFile()
-        Log.i(TAG, "libicu70 installed successfully")
+        Log.i(TAG, "ICU libraries installed → $targetDir")
     }
 
     // ── Step 4: Install .NET 9 Runtime manually ───────────────────────────────
@@ -390,16 +406,11 @@ class ProotInstaller @Inject constructor(
             appendLine("export DOTNET_ROOT=/root/.dotnet")
             appendLine("export PATH=\"\$PATH:/root/.dotnet\"")
             appendLine()
-            appendLine("# ── ICU library path — .NET uses dlopen to find libicuuc ─")
-            appendLine("# ldconfig cache may not be populated inside proot on Android")
-            appendLine("# Point LD_LIBRARY_PATH directly so dlopen succeeds")
+            appendLine("# ── ICU library path — real ICU libs bundled + extracted ─")
+            appendLine("# to usr/lib/aarch64-linux-gnu (see step3_InstallIcu). Terraria")
+            appendLine("# needs real culture support (hard-codes CultureInfo(\"en-US\")) —")
+            appendLine("# DOTNET_SYSTEM_GLOBALIZATION_INVARIANT would break this, do NOT set it.")
             appendLine("export LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu:\$LD_LIBRARY_PATH")
-            appendLine()
-            appendLine("# ── ICU / Globalization ───────────────────────────────────")
-            appendLine("# .NET 9 looks for libicuuc.so — not installed in minimal rootfs.")
-            appendLine("# Invariant mode bypasses ICU entirely. TShock game logic doesn't")
-            appendLine("# need locale-sensitive string operations.")
-            appendLine("export DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1")
             appendLine()
             appendLine("# ── GC settings — required for ARM64 Android stability ───")
             appendLine("# Server GC is tuned for datacenter multi-core, not mobile")
