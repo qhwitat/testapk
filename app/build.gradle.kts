@@ -228,8 +228,97 @@ tasks.register("downloadProotBinary") {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Task: downloadIcuLibs
+// Downloads libicu70 (Ubuntu 22.04 jammy, arm64) and extracts the shared
+// libraries into assets/icu-libs.tar.gz — bundled in the APK, extracted onto
+// the rootfs filesystem directly at runtime (plain tar, NO proot involved).
+//
+// WHY build-time instead of runtime download:
+//   Android's toybox shell has NO `ar` command, so a .deb (ar archive) cannot
+//   be unpacked on-device without going through proot. Earlier attempts using
+//   `dpkg-deb -x` INSIDE proot failed silently (unclear cause — proot syscall
+//   translation edge case, or dpkg-deb quirk on Android). This build-time
+//   approach sidesteps that entirely: unpack on the CI runner (full toolchain
+//   available), ship only the resulting .so files, extract with plain `tar`
+//   directly onto rootfsDir on the Android host filesystem — the exact same
+//   proven, reliable code path already used for rootfs/.NET/TShock extraction.
+//
+// WHY real ICU instead of DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1:
+//   Terraria's LanguageManager hard-codes creation of CultureInfo("en-US").
+//   In invariant mode .NET can ONLY create the invariant culture — any named
+//   culture throws CultureNotFoundException. Invariant mode is not viable for
+//   TShock; real ICU libraries are required.
+//
+// Package: libicu70 from ports.ubuntu.com, jammy (22.04), binary-arm64
+// Contains: libicuuc.so.70(.1), libicudata.so.70(.1), libicui18n.so.70(.1)
+//           + the runtime SONAME symlinks (shipped by the package itself,
+//           usable immediately without ldconfig)
+// ─────────────────────────────────────────────────────────────────────────────
 
-// Auto-download proot before every build — safe to run repeatedly (idempotent)
+tasks.register("downloadIcuLibs") {
+    description = "Extracts libicu70 .so files (Ubuntu 22.04 arm64) into assets/icu-libs.tar.gz"
+    group       = "setup"
+
+    val icuAsset = project.file("src/main/assets/icu-libs.tar.gz")
+    outputs.file(icuAsset)
+
+    doLast {
+        if (icuAsset.exists() && icuAsset.length() > 1_000_000L) {
+            logger.lifecycle("icu-libs.tar.gz already present (${icuAsset.length() / 1024 / 1024} MB) — skipping")
+            return@doLast
+        }
+        icuAsset.parentFile.mkdirs()
+
+        val tmp = temporaryDir.also { it.mkdirs() }
+        val d   = "\$"
+
+        exec {
+            isIgnoreExitValue = false
+            commandLine("bash", "-c", """
+                set -euo pipefail
+                cd '${tmp.absolutePath}'
+                mkdir -p icu_ext
+
+                echo "Fetching Ubuntu jammy arm64 package index..."
+                curl -fsSL -o Packages.gz \
+                    'http://ports.ubuntu.com/ubuntu-ports/dists/jammy/main/binary-arm64/Packages.gz'
+                gunzip -f Packages.gz
+
+                DEB_REL=${d}(awk '
+                    /^Package: libicu70${'$'}/ { found=1; next }
+                    found && /^Filename:/       { print ${'$'}2; exit }
+                    /^Package:/                 { found=0 }
+                ' Packages)
+                [ -z "${d}{DEB_REL}" ] && echo "ERROR: libicu70 not found in index" && exit 1
+
+                DEB_URL="http://ports.ubuntu.com/ubuntu-ports/${d}{DEB_REL}"
+                echo "Downloading ${d}{DEB_URL}..."
+                curl -fsSL -o libicu70.deb "${d}{DEB_URL}"
+
+                ar x libicu70.deb
+                if   [ -f data.tar.xz  ]; then tar -xJf data.tar.xz  -C icu_ext/
+                elif [ -f data.tar.zst ]; then zstd -d data.tar.zst --stdout | tar -x -C icu_ext/
+                elif [ -f data.tar.gz  ]; then tar -xzf data.tar.gz  -C icu_ext/
+                else echo "ERROR: unknown data.tar format" && exit 1; fi
+
+                ICU_DIR=${d}(dirname "${d}(find icu_ext/ -name 'libicuuc.so*' | head -1)")
+                [ -z "${d}{ICU_DIR}" ] && echo "ERROR: libicuuc.so not found after extraction" && exit 1
+
+                echo "Found ICU libs in: ${d}{ICU_DIR}"
+                cd "${d}{ICU_DIR}"
+                tar -czf '${icuAsset.absolutePath}' libicu*.so*
+
+                echo "Done: ${d}(du -h '${icuAsset.absolutePath}' | cut -f1)"
+            """.trimIndent())
+        }
+    }
+}
+
+
+
+// Auto-download proot + icu before every build — safe to run repeatedly (idempotent)
 tasks.named("preBuild").configure {
     dependsOn("downloadProotBinary")
+    dependsOn("downloadIcuLibs")
 }
