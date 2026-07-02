@@ -273,47 +273,100 @@ tasks.register("downloadIcuLibs") {
         val tmp = temporaryDir.also { it.mkdirs() }
         val d   = "\$"
 
+        // Two mirrors tried in order — ports.ubuntu.com is GeoDNS and has
+        // occasionally been flaky from certain cloud datacenter IP ranges.
+        // us.ports.ubuntu.com is a fixed, verified-reachable fallback.
+        val mirrors = listOf(
+            "http://ports.ubuntu.com/ubuntu-ports",
+            "http://us.ports.ubuntu.com/ubuntu-ports"
+        )
+
         exec {
             isIgnoreExitValue = false
             commandLine("bash", "-c", """
-                set -euo pipefail
+                set -uo pipefail
                 cd '${tmp.absolutePath}'
-                mkdir -p icu_ext
+                rm -rf icu_ext; mkdir -p icu_ext
 
-                echo "Fetching Ubuntu jammy arm64 package index..."
-                curl -fsSL -o Packages.gz \
-                    'http://ports.ubuntu.com/ubuntu-ports/dists/jammy/main/binary-arm64/Packages.gz'
-                gunzip -f Packages.gz
+                MIRRORS=(${mirrors.joinToString(" ") { "'$it'" }})
+                OK=0
+                for BASE in "${d}{MIRRORS[@]}"; do
+                    echo "=== Trying mirror: ${d}BASE ==="
 
-                DEB_REL=${d}(awk '
-                    /^Package: libicu70${'$'}/ { found=1; next }
-                    found && /^Filename:/       { print ${'$'}2; exit }
-                    /^Package:/                 { found=0 }
-                ' Packages)
-                [ -z "${d}{DEB_REL}" ] && echo "ERROR: libicu70 not found in index" && exit 1
+                    echo "[1/6] Fetching package index..."
+                    HTTP=${d}(curl -sS -o Packages.gz -w '%{http_code}' \
+                        "${d}BASE/dists/jammy/main/binary-arm64/Packages.gz" || echo "000")
+                    echo "      HTTP status: ${d}HTTP, size: ${d}(wc -c < Packages.gz 2>/dev/null || echo 0) bytes"
+                    if [ "${d}HTTP" != "200" ]; then
+                        echo "      FAILED on this mirror, trying next..."
+                        continue
+                    fi
 
-                DEB_URL="http://ports.ubuntu.com/ubuntu-ports/${d}{DEB_REL}"
-                echo "Downloading ${d}{DEB_URL}..."
-                curl -fsSL -o libicu70.deb "${d}{DEB_URL}"
+                    echo "[2/6] Decompressing index..."
+                    gunzip -f Packages.gz || { echo "      gunzip FAILED"; continue; }
+                    echo "      Packages file: ${d}(wc -l < Packages) lines"
 
-                ar x libicu70.deb
-                if   [ -f data.tar.xz  ]; then tar -xJf data.tar.xz  -C icu_ext/
-                elif [ -f data.tar.zst ]; then zstd -d data.tar.zst --stdout | tar -x -C icu_ext/
-                elif [ -f data.tar.gz  ]; then tar -xzf data.tar.gz  -C icu_ext/
-                else echo "ERROR: unknown data.tar format" && exit 1; fi
+                    echo "[3/6] Locating libicu70 in index..."
+                    DEB_REL=${d}(awk '
+                        /^Package: libicu70${'$'}/ { found=1; next }
+                        found && /^Filename:/       { print ${'$'}2; exit }
+                        /^Package:/                 { found=0 }
+                    ' Packages)
+                    echo "      Filename field: '${d}DEB_REL'"
+                    if [ -z "${d}DEB_REL" ]; then
+                        echo "      NOT FOUND in index, trying next mirror..."
+                        continue
+                    fi
 
-                ICU_DIR=${d}(dirname "${d}(find icu_ext/ -name 'libicuuc.so*' | head -1)")
-                [ -z "${d}{ICU_DIR}" ] && echo "ERROR: libicuuc.so not found after extraction" && exit 1
+                    echo "[4/6] Downloading .deb..."
+                    DEB_URL="${d}BASE/${d}DEB_REL"
+                    echo "      URL: ${d}DEB_URL"
+                    HTTP=${d}(curl -sS -o libicu70.deb -w '%{http_code}' "${d}DEB_URL" || echo "000")
+                    echo "      HTTP status: ${d}HTTP, size: ${d}(wc -c < libicu70.deb 2>/dev/null || echo 0) bytes"
+                    if [ "${d}HTTP" != "200" ]; then
+                        echo "      Download FAILED, trying next mirror..."
+                        continue
+                    fi
 
-                echo "Found ICU libs in: ${d}{ICU_DIR}"
-                cd "${d}{ICU_DIR}"
-                tar -czf '${icuAsset.absolutePath}' libicu*.so*
+                    echo "[5/6] Extracting .deb (ar + tar)..."
+                    ar x libicu70.deb 2>&1
+                    ls -la data.tar.* 2>&1 || echo "      no data.tar.* produced by ar!"
+                    if   [ -f data.tar.xz  ]; then tar -xJf data.tar.xz  -C icu_ext/
+                    elif [ -f data.tar.zst ]; then zstd -d data.tar.zst --stdout | tar -x -C icu_ext/
+                    elif [ -f data.tar.gz  ]; then tar -xzf data.tar.gz  -C icu_ext/
+                    else echo "      ERROR: unknown data.tar format"; continue; fi
 
-                echo "Done: ${d}(du -h '${icuAsset.absolutePath}' | cut -f1)"
+                    ICU_DIR=${d}(dirname "${d}(find icu_ext/ -name 'libicuuc.so*' | head -1)" 2>/dev/null)
+                    echo "      ICU dir found: '${d}ICU_DIR'"
+                    if [ -z "${d}ICU_DIR" ] || [ "${d}ICU_DIR" = "." ]; then
+                        echo "      libicuuc.so NOT found after extraction, trying next mirror..."
+                        continue
+                    fi
+
+                    echo "[6/6] Packaging into icu-libs.tar.gz..."
+                    cd "${d}ICU_DIR"
+                    ls -la libicu* 2>&1
+                    tar -czf '${icuAsset.absolutePath}' libicu*.so*
+                    echo "      Done: ${d}(du -h '${icuAsset.absolutePath}' | cut -f1)"
+                    OK=1
+                    break
+                done
+
+                if [ "${d}OK" != "1" ]; then
+                    echo "=== ALL MIRRORS FAILED ==="
+                    exit 1
+                fi
             """.trimIndent())
+        }
+
+        if (!icuAsset.exists() || icuAsset.length() < 1_000_000L) {
+            throw GradleException(
+                "downloadIcuLibs: icu-libs.tar.gz missing or too small after task ran — check log above"
+            )
         }
     }
 }
+
 
 
 
